@@ -1,0 +1,34 @@
+# Build output
+/Debug/
+/Release/
+/build/
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.su
+*.cyclo
+
+# Local IDE/debugger state (keep portable project configuration)
+/.metadata/
+/.settings/language.settings.xml
+/.settings/com.st.stm32cube.ide.mcu.sfrview.prefs
+/.mxproject
+/.osx.project
+/*.launch
+/* Debug.cfg
+*.log
+.DS_Store
+
+# Dependencies and credentials
+node_modules/
+.venv/
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
