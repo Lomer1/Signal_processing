@@ -210,7 +210,8 @@ static void TimIcGpio(GPIO_TypeDef *port, uint16_t pin, uint32_t af)
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     GPIO_InitStruct.Pin       = pin;
     GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull      = GPIO_PULLDOWN;
+    /* Signal already has an external path; internal pulldown loads the RC edge. */
+    GPIO_InitStruct.Pull      = GPIO_NOPULL;
     GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStruct.Alternate = af;
     HAL_GPIO_Init(port, &GPIO_InitStruct);
@@ -346,7 +347,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart)
         GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
         HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-        HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
+        HAL_NVIC_SetPriority(USART2_IRQn, 2, 0);
         HAL_NVIC_EnableIRQ(USART2_IRQn);
     }
 }

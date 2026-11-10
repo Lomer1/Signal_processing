@@ -13,14 +13,20 @@
 
 #define NUM_CHANNELS             8U
 #define ADC_RANKS                4U
-#define ADC_BURST_SAMPLES        256U
+/* 512 scans @ 2 µs ≈ 1 ms of ring per ADC — headroom for 8 concurrent CTs. */
+#define ADC_BURST_SAMPLES        512U
 #define ADC_BUF_LEN              (ADC_BURST_SAMPLES * ADC_RANKS)
 #define ADC_SCAN_PERIOD_US       2U
+#define NVIC_PRIO_DMA_ADC        0U
+#define NVIC_PRIO_TIM_BREAK      0U
+#define NVIC_PRIO_TIM_CAPTURE    1U
+#define NVIC_PRIO_USART          2U
 
 #define VREF                     3.3f
 #define R_SHUNT                  0.95f
 #define ADC_MAX                  4095.0f
 #define SIGNAL_TIMEOUT_MS        1000U
+#define ACQ_FAULT_REARM_MS       SIGNAL_TIMEOUT_MS
 
 #define MODBUS_SLAVE_ADDR        0x01U
 #define MODBUS_FUNC_READ_HOLDING 0x03U
@@ -42,6 +48,9 @@
 #define DAC_OVERCURRENT_CODE     ((uint32_t)(OVERCURRENT_LIMIT_MA * R_SHUNT * 4096.0f / VREF + 0.5f))
 #define ALARM_PULSE_WIDTH_US     300U
 #define ENERGY_SAMPLE_PERIOD_MS  10U
+/* External 100 Ω + C and GPIO Schmitt thresholds shorten the digital pulse.
+   Trim restores generator width (300 µs in → ~273 µs raw → 300 µs reported). */
+#define PULSE_WIDTH_SLEW_TRIM_US 27U
 
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
@@ -82,6 +91,7 @@ typedef struct
     volatile uint8_t end_scan_valid;
     volatile uint8_t deferred_fall;
     volatile uint32_t deferred_fall_time;
+    volatile uint8_t pending_stop;
     volatile uint8_t measurement_valid;
     volatile uint8_t capture_error;
     volatile uint8_t have_rise;
@@ -113,12 +123,14 @@ static volatile uint8_t  adc2_burst_running = 0U;
 static volatile uint8_t  tim20_running      = 0U;
 static volatile uint8_t  adc1_active_mask   = 0U;
 static volatile uint8_t  adc2_active_mask   = 0U;
+static volatile uint8_t  pending_stop_mask  = 0U;
 static volatile uint32_t dma_epochs[2];
 static uint32_t consumed_scans[2];
 static volatile uint32_t ic_epochs[2];
 static volatile uint8_t protection_tripped;
 static volatile uint8_t acquisition_fault;
 static volatile uint32_t protection_last_high;
+static volatile uint32_t acquisition_fault_tick;
 
 /* Bench diagnostics: keep these visible in the debugger. */
 volatile uint32_t adc_diag_start_count[2];
@@ -129,8 +141,9 @@ volatile uint32_t adc_diag_break_count;
 volatile uint32_t adc_diag_last_error;
 volatile uint32_t adc_diag_update_count[NUM_CHANNELS];
 volatile uint8_t  adc_diag_reject_flags[NUM_CHANNELS];
-/* First fault survives all subsequent blocked starts until reset. */
+/* First fault in the current fault epoch; cleared on soft-rearm. */
 volatile uint32_t adc_diag_first_fault;
+volatile uint32_t adc_diag_rearm_count;
 volatile uint32_t adc_diag_block_flags;
 volatile uint32_t adc_diag_fault_amp;
 volatile uint32_t adc_diag_fault_status;
@@ -192,8 +205,10 @@ static void     Modbus_SendResponse(uint8_t len);
 static void     Modbus_SendException(uint8_t slave, uint8_t func, uint8_t ex_code);
 static void     Modbus_ResetRxState(void);
 
-static void     StartAdcCapture(uint8_t idx);
-static void     StopAdcCapture(uint8_t idx);
+static void     RequestAdcStart(uint8_t idx);
+static void     RequestAdcStop(uint8_t idx);
+static void     ServicePendingAdcStops(void);
+static void     ClearAcquisitionFaultState(void);
 static void     StartTim20IfNeeded(void);
 static void     StopTim20IfIdle(void);
 static void     DrainAdc(uint8_t amp);
@@ -207,6 +222,17 @@ static void     LatchAmpOvercurrent(uint8_t amp);
 static void     SampleEnergyAdc(void);
 static void     ConfigPwmInput(TIM_HandleTypeDef *htim, uint32_t period,
                                uint8_t rise_on_ch2, IRQn_Type irqn);
+static uint16_t PulseWidthFromTicks(uint32_t width_ticks);
+
+static uint16_t PulseWidthFromTicks(uint32_t width_ticks)
+{
+    if (width_ticks == 0U) return 0U;
+    if (width_ticks < (uint32_t)UINT16_MAX - PULSE_WIDTH_SLEW_TRIM_US)
+        width_ticks += PULSE_WIDTH_SLEW_TRIM_US;
+    else
+        width_ticks = UINT16_MAX;
+    return (uint16_t)width_ticks;
+}
 
 static void StartTim20IfNeeded(void)
 {
@@ -254,10 +280,48 @@ static void RecordAcquisitionFault(uint32_t reason, uint8_t amp, uint32_t status
         adc_diag_fault_cursor_remaining = adc_diag_cursor_remaining[amp];
         adc_diag_fault_cursor_tc = adc_diag_cursor_tc[amp];
     }
+    else
+        adc_diag_last_error = reason;
     acquisition_fault = 1U;
+    acquisition_fault_tick = HAL_GetTick();
     /* UPDATE/TRGO is not gated by MOE: stop the counter explicitly. */
     CLEAR_BIT(TIM20->CR1, TIM_CR1_CEN);
     HAL_GPIO_WritePin(ALARM_GPIO_Port, ALARM_Pin, GPIO_PIN_SET);
+}
+
+static void ResetDualEdgePolarity(void)
+{
+    TIM16->CCER &= ~TIM_CCER_CC1E;
+    TIM17->CCER &= ~TIM_CCER_CC1E;
+    TIM16->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC1NP);
+    TIM17->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC1NP);
+    TIM16->CCER |= TIM_CCER_CC1E;
+    TIM17->CCER |= TIM_CCER_CC1E;
+}
+
+static void ClearAcquisitionFaultState(void)
+{
+    if (adc1_burst_running) (void)HAL_ADC_Stop_DMA(&hadc1);
+    if (adc2_burst_running) (void)HAL_ADC_Stop_DMA(&hadc2);
+    adc1_burst_running = adc2_burst_running = tim20_running = 0U;
+    adc1_active_mask = adc2_active_mask = 0U;
+    pending_stop_mask = 0U;
+    dma_epochs[0] = dma_epochs[1] = 0U;
+    consumed_scans[0] = consumed_scans[1] = 0U;
+    for (uint8_t i = 0U; i < NUM_CHANNELS; i++)
+    {
+        ch[i].capture_active = ch[i].capture_done = ch[i].measurement_valid = 0U;
+        ch[i].end_scan_valid = ch[i].deferred_fall = ch[i].pending_stop = 0U;
+        ch[i].expect_falling = ch[i].have_rise = 0U;
+        ch[i].capture_error = 0U;
+    }
+    ResetDualEdgePolarity();
+    acquisition_fault = 0U;
+    adc_diag_first_fault = 0U;
+    adc_diag_block_flags = 0U;
+    adc_diag_rearm_count++;
+    if (!protection_tripped)
+        HAL_GPIO_WritePin(ALARM_GPIO_Port, ALARM_Pin, GPIO_PIN_RESET);
 }
 
 static uint64_t ProducedWords(uint8_t amp)
@@ -287,7 +351,7 @@ static TIM_TypeDef *CaptureTimer(uint8_t idx)
     return timers[idx];
 }
 
-static void LatchCaptureEnd(uint8_t idx, uint8_t defer_irq)
+static void LatchCaptureEnd(uint8_t idx)
 {
     Channel_t *c = &ch[idx];
     if (!c->capture_active || c->end_scan_valid) return;
@@ -304,23 +368,14 @@ static void LatchCaptureEnd(uint8_t idx, uint8_t defer_irq)
     uint32_t discard = late / ADC_SCAN_PERIOD_US +
         ((late % ADC_SCAN_PERIOD_US) != 0U) + 1U;
     int32_t available = (int32_t)(produced - c->first_scan);
-    c->end_scan = (available <= 0 || discard >= (uint32_t)available)
-        ? c->first_scan : produced - discard;
+    if (available <= 0)
+        c->end_scan = c->first_scan;
+    else if (discard >= (uint32_t)available)
+        /* Prefer keeping in-pulse samples over publishing an empty window. */
+        c->end_scan = produced;
+    else
+        c->end_scan = produced - discard;
     c->end_scan_valid = 1U;
-    if (defer_irq)
-    {
-        static const IRQn_Type irqs[NUM_CHANNELS] = {
-            TIM2_IRQn, TIM3_IRQn, TIM4_IRQn, TIM1_CC_IRQn,
-            TIM8_CC_IRQn, TIM5_IRQn, TIM1_TRG_COM_TIM17_IRQn, TIM1_UP_TIM16_IRQn
-        };
-        /* Reading CCR after SR acknowledges CCxIF. Preserve that event for
-           the timer handler instead of silently consuming its falling edge. */
-        c->deferred_fall_time = idx < 6U ? falling :
-            AcquisitionCaptureTime(ic_epochs[idx == 7U ? 0U : 1U],
-                (uint16_t)falling, (uint16_t)counter, (tim->SR & TIM_SR_UIF) != 0U);
-        c->deferred_fall = 1U;
-        HAL_NVIC_SetPendingIRQ(irqs[idx]);
-    }
 }
 
 static ACQUISITION_FAST void DrainAdc(uint8_t amp)
@@ -344,10 +399,13 @@ static ACQUISITION_FAST void DrainAdc(uint8_t amp)
         if (!c->capture_active) continue;
         uint8_t idx = amp * ADC_RANKS + slot;
         uint32_t fall_flag = (idx < 2U || idx >= 6U) ? TIM_SR_CC1IF : TIM_SR_CC2IF;
-        /* DMA can run before the pending capture IRQ. Respect the hardware
-           falling edge here too, not just in StopAdcCapture(). */
+        /* DMA can observe the falling edge before the TIM IRQ runs. */
         if (!c->end_scan_valid && (CaptureTimer(idx)->SR & fall_flag))
-            LatchCaptureEnd(idx, 1U);
+        {
+            LatchCaptureEnd(idx);
+            c->pending_stop = 1U;
+            pending_stop_mask |= (uint8_t)(1U << idx);
+        }
         uint32_t limit = produced;
         if (c->end_scan_valid && (int32_t)(limit - c->end_scan) > 0)
             limit = c->end_scan;
@@ -411,6 +469,7 @@ void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1) { adc_diag_dma_half_count[0]++; DrainAdc(0U); }
     if (hadc->Instance == ADC2) { adc_diag_dma_half_count[1]++; DrainAdc(1U); }
+    ServicePendingAdcStops();
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
@@ -421,6 +480,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     if (hadc->Instance == ADC2) { dma_epochs[1]++; adc_diag_dma_full_count[1]++; }
     if (hadc->Instance == ADC1) DrainAdc(0U);
     if (hadc->Instance == ADC2) DrainAdc(1U);
+    ServicePendingAdcStops();
 }
 
 void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
@@ -431,7 +491,8 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
     }
 }
 
-static void StartAdcCapture(uint8_t idx)
+/* TIM capture IRQ path: no DrainAdc. Keep 8 sync rises under a few microseconds. */
+static void RequestAdcStart(uint8_t idx)
 {
     if (protection_tripped || acquisition_fault ||
         HAL_COMP_GetOutputLevel(&hcomp1) == COMP_OUTPUT_LEVEL_HIGH ||
@@ -449,12 +510,31 @@ static void StartAdcCapture(uint8_t idx)
     uint8_t amp = idx / 4U;
     volatile uint8_t *running = amp ? &adc2_burst_running : &adc1_burst_running;
     volatile uint8_t *active = amp ? &adc2_active_mask : &adc1_active_mask;
-    DrainAdc(amp);
-    if (acquisition_fault) return;
-    if (ch[idx].capture_active) ch[idx].capture_error = 1U;
-    else ch[idx].capture_error = 0U;
+
+    /* Rare: next rise before deferred stop ran. Finalize this channel only —
+       no DrainAdc here (keeps 8-sync TIM IRQs short). */
+    if (ch[idx].pending_stop || ch[idx].capture_active)
+    {
+        if (ch[idx].capture_active)
+        {
+            ch[idx].capture_sum = ch[idx].live_sum;
+            ch[idx].capture_count = ch[idx].live_count;
+            ch[idx].capture_peak = ch[idx].live_peak;
+            ch[idx].capture_done = 1U;
+            ch[idx].capture_error = 1U;
+            *active &= (uint8_t)~(1U << (idx % 4U));
+        }
+        ch[idx].capture_active = 0U;
+        ch[idx].pending_stop = 0U;
+        ch[idx].end_scan_valid = 0U;
+        pending_stop_mask &= (uint8_t)~(1U << idx);
+    }
+    else
+        ch[idx].capture_error = 0U;
+
     ch[idx].live_sum = ch[idx].live_count = 0U;
     ch[idx].live_peak = 0U;
+
     if (!*running)
     {
         dma_epochs[amp] = consumed_scans[amp] = 0U;
@@ -476,32 +556,59 @@ static void StartAdcCapture(uint8_t idx)
     StartTim20IfNeeded();
 }
 
-static void StopAdcCapture(uint8_t idx)
+static void RequestAdcStop(uint8_t idx)
 {
     if (!ch[idx].capture_active) return;
-    /* HAL has already cleared CCxIF, but the captured edge is still in CCRx. */
-    LatchCaptureEnd(idx, 0U);
-    uint8_t amp = idx / 4U;
-    volatile uint8_t *running = amp ? &adc2_burst_running : &adc1_burst_running;
-    volatile uint8_t *active = amp ? &adc2_active_mask : &adc1_active_mask;
-    DrainAdc(amp);
-    ch[idx].capture_active = 0U;
-    ch[idx].capture_sum = ch[idx].live_sum;
-    ch[idx].capture_count = ch[idx].live_count;
-    ch[idx].capture_peak = ch[idx].live_peak;
-    ch[idx].capture_done = 1U;
-    *active &= (uint8_t)~(1U << (idx % 4U));
-    if (*active == 0U && *running)
+    LatchCaptureEnd(idx);
+    ch[idx].pending_stop = 1U;
+    pending_stop_mask |= (uint8_t)(1U << idx);
+}
+
+static void ServicePendingAdcStops(void)
+{
+    uint8_t mask = pending_stop_mask;
+    if (mask == 0U || acquisition_fault) return;
+
+    if (mask & 0x0FU) DrainAdc(0U);
+    if (mask & 0xF0U) DrainAdc(1U);
+    if (acquisition_fault) return;
+
+    __disable_irq();
+    mask = pending_stop_mask;
+    pending_stop_mask = 0U;
+    for (uint8_t idx = 0U; idx < NUM_CHANNELS; idx++)
     {
-        *running = 0U;
-        StopTim20IfIdle();
-        HAL_StatusTypeDef status = HAL_ADC_Stop_DMA(AmpAdc(amp));
-        if (status != HAL_OK)
+        if ((mask & (uint8_t)(1U << idx)) == 0U) continue;
+        Channel_t *c = &ch[idx];
+        c->pending_stop = 0U;
+        if (!c->capture_active) continue;
+
+        uint8_t amp = idx / 4U;
+        volatile uint8_t *running = amp ? &adc2_burst_running : &adc1_burst_running;
+        volatile uint8_t *active = amp ? &adc2_active_mask : &adc1_active_mask;
+
+        c->capture_active = 0U;
+        c->capture_sum = c->live_sum;
+        c->capture_count = c->live_count;
+        c->capture_peak = c->live_peak;
+        c->capture_done = 1U;
+        c->end_scan_valid = 0U;
+        *active &= (uint8_t)~(1U << (idx % 4U));
+        if (*active == 0U && *running)
         {
-            RecordAcquisitionFault(0x570F0000U, amp, status);
+            *running = 0U;
+            StopTim20IfIdle();
+            HAL_StatusTypeDef status = HAL_ADC_Stop_DMA(AmpAdc(amp));
+            if (status != HAL_OK)
+            {
+                __enable_irq();
+                RecordAcquisitionFault(0x570F0000U, amp, status);
+                return;
+            }
+            adc_diag_stop_count[amp]++;
         }
-        adc_diag_stop_count[amp]++;
     }
+    __enable_irq();
 }
 
 static void UpdateMeasuredValues(uint8_t idx)
@@ -697,16 +804,27 @@ static void ServiceProtection(void)
     if (adc2_burst_running) HAL_ADC_Stop_DMA(&hadc2);
     adc1_burst_running = adc2_burst_running = tim20_running = 0U;
     adc1_active_mask = adc2_active_mask = 0U;
+    pending_stop_mask = 0U;
     for (uint8_t i = 0U; i < NUM_CHANNELS; i++)
     {
         ch[i].capture_active = ch[i].capture_done = ch[i].measurement_valid = 0U;
+        ch[i].end_scan_valid = ch[i].deferred_fall = ch[i].pending_stop = 0U;
     }
-    /* Fault of the measurement machinery requires reset. Comparator trips may
-       rearm only after a full second healthy AND all input pulses have ended. */
     if (HAL_COMP_GetOutputLevel(&hcomp1) == COMP_OUTPUT_LEVEL_HIGH ||
         HAL_COMP_GetOutputLevel(&hcomp2) == COMP_OUTPUT_LEVEL_HIGH)
         protection_last_high = now;
-    if (!acquisition_fault && (now - protection_last_high >= SIGNAL_TIMEOUT_MS) &&
+
+    /* DMA overrun / stuck capture: soft-rearm after quiet period, no MCU reset. */
+    if (acquisition_fault &&
+        (now - acquisition_fault_tick >= ACQ_FAULT_REARM_MS) &&
+        !PulseInputsHigh())
+    {
+        ClearAcquisitionFaultState();
+    }
+
+    /* Comparator trips rearm only after a full second healthy AND all inputs low. */
+    if (!acquisition_fault && protection_tripped &&
+        (now - protection_last_high >= SIGNAL_TIMEOUT_MS) &&
         !PulseInputsHigh())
     {
         for (uint8_t i = 0U; i < NUM_CHANNELS; i++)
@@ -714,15 +832,11 @@ static void ServiceProtection(void)
             ch[i].comp_overcurrent_latched = ch[i].comp_overcurrent = 0U;
             ch[i].expect_falling = ch[i].have_rise = 0U;
         }
-        TIM16->CCER &= ~TIM_CCER_CC1E;
-        TIM17->CCER &= ~TIM_CCER_CC1E;
-        TIM16->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC1NP);
-        TIM17->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC1NP);
-        TIM16->CCER |= TIM_CCER_CC1E;
-        TIM17->CCER |= TIM_CCER_CC1E;
+        ResetDualEdgePolarity();
         __HAL_TIM_CLEAR_FLAG(&htim20, TIM_FLAG_BREAK);
         protection_tripped = 0U;
         __HAL_TIM_ENABLE_IT(&htim20, TIM_IT_BREAK);
+        HAL_GPIO_WritePin(ALARM_GPIO_Port, ALARM_Pin, GPIO_PIN_RESET);
     }
     __enable_irq();
 }
@@ -735,28 +849,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
 void AcquisitionCaptureIRQ(TIM_HandleTypeDef *htim)
 {
-    for (uint8_t idx = 0U; idx < NUM_CHANNELS; idx++)
-    {
-        Channel_t *c = &ch[idx];
-        if (CaptureTimer(idx) != htim->Instance || !c->deferred_fall) continue;
-        c->deferred_fall = 0U;
-        if (!c->capture_active) break;
-        /* Finish the saved falling edge BEFORE HAL handles a newer rise. */
-        uint32_t width = c->deferred_fall_time;
-        if (idx >= 6U)
-        {
-            width -= c->ic_rise;
-            c->expect_falling = 0U;
-            htim->Instance->CCER &= ~TIM_CCER_CC1E;
-            htim->Instance->CCER &= (uint32_t)~TIM_CCER_CC1P;
-            htim->Instance->CCER |= TIM_CCER_CC1E;
-        }
-        if (width > UINT16_MAX || HAL_GetTick() - c->rise_tick >= 66U)
-            width = UINT16_MAX;
-        c->pulse_width_us = (uint16_t)width;
-        StopAdcCapture(idx);
-        break;
-    }
+    /* Deferred fall path removed: LatchCaptureEnd + pending_stop from TIM/DMA. */
     HAL_TIM_IRQHandler(htim);
 }
 
@@ -768,25 +861,28 @@ static void HandleSingleChannelIc(uint8_t idx, TIM_TypeDef *inst, TIM_HandleType
 
     if (!ch[idx].expect_falling)
     {
+        /* Arm falling edge before any ADC work so a short pulse is not missed. */
+        inst->CCER &= ~TIM_CCER_CC1E;
+        inst->CCER |= TIM_CCER_CC1P;
+        inst->CCER |= TIM_CCER_CC1E;
         ch[idx].pulse_period_ticks = ch[idx].have_rise ? ccr - ch[idx].ic_rise : 0U;
         ch[idx].have_rise = 1U;
         ch[idx].ic_rise = ccr;
         ch[idx].rise_tick = HAL_GetTick();
         ch[idx].expect_falling = 1U;
-        inst->CCER &= ~TIM_CCER_CC1E;
-        inst->CCER |= TIM_CCER_CC1P;
-        inst->CCER |= TIM_CCER_CC1E;
-        StartAdcCapture(idx);
+        RequestAdcStart(idx);
     }
     else
     {
-        uint32_t width = ccr - ch[idx].ic_rise;
-        ch[idx].pulse_width_us = width > UINT16_MAX ? UINT16_MAX : (uint16_t)width;
-        ch[idx].expect_falling = 0U;
+        /* Re-arm rising edge first; ADC finalize is deferred out of this IRQ. */
         inst->CCER &= ~TIM_CCER_CC1E;
         inst->CCER &= (uint32_t)~TIM_CCER_CC1P;
         inst->CCER |= TIM_CCER_CC1E;
-        StopAdcCapture(idx);
+        uint32_t width = ccr - ch[idx].ic_rise;
+        if (width > UINT16_MAX) width = UINT16_MAX;
+        ch[idx].pulse_width_us = PulseWidthFromTicks(width);
+        ch[idx].expect_falling = 0U;
+        RequestAdcStop(idx);
     }
 }
 
@@ -820,7 +916,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
         }
         ch[idx].pulse_period_ticks = period;
         ch[idx].rise_tick          = HAL_GetTick();
-        StartAdcCapture(idx);
+        RequestAdcStart(idx);
     }
 
     if (htim->Channel == (HAL_TIM_ActiveChannel)falling_ch)
@@ -829,8 +925,8 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
             htim, rise_is_ch2 ? TIM_CHANNEL_1 : TIM_CHANNEL_2);
         if (width > UINT16_MAX || HAL_GetTick() - ch[idx].rise_tick >= 66U)
             width = UINT16_MAX;
-        ch[idx].pulse_width_us = (uint16_t)width;
-        StopAdcCapture(idx);
+        ch[idx].pulse_width_us = PulseWidthFromTicks(width);
+        RequestAdcStop(idx);
     }
 }
 
@@ -839,7 +935,7 @@ int main(void)
     HAL_Init();
     SystemClock_Config();
     /* Halt the ADC trigger with the CPU; otherwise DMA wraps unobserved during
-       a breakpoint and the first Resume can permanently latch a capture fault.
+       a breakpoint and Resume trips acquisition_fault (soft-rearms after 1 s idle).
        External generator edges while halted are still not valid measurements. */
     __HAL_DBGMCU_FREEZE_TIM20();
     __HAL_DBGMCU_FREEZE_TIM1();
@@ -922,6 +1018,11 @@ int main(void)
                 LatchAmpOvercurrent(i / 4U);
             UpdateMeasuredValues(i);
         }
+
+        ServicePendingAdcStops();
+        if (adc1_burst_running) DrainAdc(0U);
+        if (adc2_burst_running) DrainAdc(1U);
+        ServicePendingAdcStops();
 
         ServiceProtection();
         SampleEnergyAdc();
@@ -1317,7 +1418,7 @@ static void ConfigPwmInput(TIM_HandleTypeDef *htim, uint32_t period,
     sConfigIC.ICPolarity  = TIM_INPUTCHANNELPOLARITY_RISING;
     sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
     sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-    sConfigIC.ICFilter    = 1;
+    sConfigIC.ICFilter    = 0;
     if (HAL_TIM_IC_ConfigChannel(htim, &sConfigIC, rise_ch) != HAL_OK) Error_Handler();
 
     sConfigIC.ICPolarity  = TIM_INPUTCHANNELPOLARITY_FALLING;
@@ -1337,7 +1438,7 @@ static void ConfigPwmInput(TIM_HandleTypeDef *htim, uint32_t period,
         sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
     if (HAL_TIMEx_MasterConfigSynchronization(htim, &sMasterConfig) != HAL_OK) Error_Handler();
 
-    HAL_NVIC_SetPriority(irqn, 0, 0);
+    HAL_NVIC_SetPriority(irqn, NVIC_PRIO_TIM_CAPTURE, 0);
     HAL_NVIC_EnableIRQ(irqn);
 }
 
@@ -1393,10 +1494,10 @@ static void MX_TIM16_Init(void)
     sConfigIC.ICPolarity  = TIM_INPUTCHANNELPOLARITY_RISING;
     sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
     sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-    sConfigIC.ICFilter    = 1;
+    sConfigIC.ICFilter    = 0;
     if (HAL_TIM_IC_ConfigChannel(&htim16, &sConfigIC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
 
-    HAL_NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(TIM1_UP_TIM16_IRQn, NVIC_PRIO_TIM_CAPTURE, 0);
     HAL_NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
 }
 
@@ -1416,10 +1517,10 @@ static void MX_TIM17_Init(void)
     sConfigIC.ICPolarity  = TIM_INPUTCHANNELPOLARITY_RISING;
     sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
     sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-    sConfigIC.ICFilter    = 1;
+    sConfigIC.ICFilter    = 0;
     if (HAL_TIM_IC_ConfigChannel(&htim17, &sConfigIC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
 
-    HAL_NVIC_SetPriority(TIM1_TRG_COM_TIM17_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(TIM1_TRG_COM_TIM17_IRQn, NVIC_PRIO_TIM_CAPTURE, 0);
     HAL_NVIC_EnableIRQ(TIM1_TRG_COM_TIM17_IRQn);
 }
 
@@ -1473,7 +1574,7 @@ static void MX_TIM20_Init(void)
     sBreakInputConfig.Polarity = TIM_BREAKINPUTSOURCE_POLARITY_HIGH;
     if (HAL_TIMEx_ConfigBreakInput(&htim20, TIM_BREAKINPUT_BRK, &sBreakInputConfig) != HAL_OK) Error_Handler();
 
-    HAL_NVIC_SetPriority(TIM20_BRK_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(TIM20_BRK_IRQn, NVIC_PRIO_TIM_BREAK, 0);
     HAL_NVIC_EnableIRQ(TIM20_BRK_IRQn);
 }
 
@@ -1521,7 +1622,7 @@ static void MX_USART2_UART_Init(void)
     if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK) Error_Handler();
     if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK) Error_Handler();
 
-    HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
+    HAL_NVIC_SetPriority(USART2_IRQn, NVIC_PRIO_USART, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
 }
 
@@ -1530,9 +1631,10 @@ static void MX_DMA_Init(void)
     __HAL_RCC_DMAMUX1_CLK_ENABLE();
     __HAL_RCC_DMA1_CLK_ENABLE();
 
-    HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+    /* DMA must preempt capture IRQs so DrainAdc keeps the ring from wrapping. */
+    HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, NVIC_PRIO_DMA_ADC, 0);
     HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-    HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, NVIC_PRIO_DMA_ADC, 0);
     HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
 }
 
